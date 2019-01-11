@@ -22,7 +22,6 @@ from __future__ import absolute_import
 from __future__ import division
 from __future__ import print_function
 
-import functools
 import os
 import tempfile
 
@@ -111,9 +110,10 @@ def model_fn(features, labels, mode, params):
     if mode == tf.estimator.ModeKeys.EVAL:
       if params["use_tpu"]:
         # host call functions should only have tensors as arguments.
-        # functools.partial() pre-populates params so that metric_fn is
+        # This lambda pre-populates params so that metric_fn is
         # TPUEstimator compliant.
-        metric_fn = functools.partial(metrics.get_eval_metrics, params=params)
+        metric_fn = lambda logits, labels: (
+            metrics.get_eval_metrics(logits, labels, params=params))
         eval_metrics = (metric_fn, [logits, labels])
         return tf.contrib.tpu.TPUEstimatorSpec(
             mode=mode, loss=loss, predictions={"predictions": logits},
@@ -555,9 +555,12 @@ def run_transformer(flags_obj):
 
   params["use_synthetic_data"] = flags_obj.use_synthetic_data
 
-  # Set batch size parameter, which depends on TPU and distribution settings.
-  params["batch_size"] = (
-      flags_obj.batch_size or params["default_batch_size_tpu"])
+  # Set batch size parameter, which depends on the availability of
+  # TPU and GPU, and distribution settings.
+  params["batch_size"] = (flags_obj.batch_size or (
+      params["default_batch_size_tpu"] if params["use_tpu"]
+      else params["default_batch_size"]))
+
   if not params["use_tpu"]:
     params["batch_size"] = distribution_utils.per_device_batch_size(
         params["batch_size"], num_gpus)
@@ -576,9 +579,12 @@ def run_transformer(flags_obj):
 
   params["repeat_dataset"] = schedule_manager.repeat_dataset
 
+  model_helpers.apply_clean(flags.FLAGS)
+
   # Create hooks that log information about the training and metric values
   train_hooks = hooks_helper.get_train_hooks(
       flags_obj.hooks,
+      model_dir=flags_obj.model_dir,
       tensors_to_log=TENSORS_TO_LOG,  # used for logging hooks
       batch_size=schedule_manager.batch_size,  # for ExamplesPerSecondHook
       use_tpu=params["use_tpu"]  # Not all hooks can run with TPUs
@@ -604,7 +610,7 @@ def run_transformer(flags_obj):
       bleu_threshold=flags_obj.stop_threshold,
       vocab_file=flags_obj.vocab_file)
 
-  if flags_obj.export_dir:
+  if flags_obj.export_dir and not params["use_tpu"]:
     serving_input_fn = export.build_tensor_serving_input_receiver_fn(
         shape=[None], dtype=tf.int64, batch_size=None)
     # Export saved model, and save the vocab file as an extra asset. The vocab
@@ -615,7 +621,8 @@ def run_transformer(flags_obj):
     # an extra asset rather than a core asset.
     estimator.export_savedmodel(
         flags_obj.export_dir, serving_input_fn,
-        assets_extra={"vocab.txt": flags_obj.vocab_file})
+        assets_extra={"vocab.txt": flags_obj.vocab_file},
+        strip_default_attrs=True)
 
 
 def main(_):
